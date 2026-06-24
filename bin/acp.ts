@@ -171,6 +171,18 @@ async function main() {
           await job.claim(id);
           break;
         }
+        case "refund": {
+          const id = args[2];
+          if (!id) { error("Usage: acp job refund <jobAddress> [--amount <lamports>]"); process.exit(1); }
+          const amountFlag = flag("--amount");
+          const amount = amountFlag ? Number(amountFlag) : undefined;
+          if (amount != null && !Number.isFinite(amount)) {
+            error(`Invalid --amount: ${amountFlag}`);
+            process.exit(1);
+          }
+          await job.refund(id, amount);
+          break;
+        }
         case "claim-fee": {
           const id = args[2];
           if (!id) { error("Usage: acp job claim-fee <jobId>"); process.exit(1); }
@@ -192,7 +204,7 @@ async function main() {
           break;
         default:
           error(`Unknown job command: ${sub}`);
-          log("Commands: create, status, accept, memo, sign, budget, deposit, claim, active, completed");
+          log("Commands: create, status, accept, memo, sign, budget, deposit, claim, claim-fee, refund, pay, active, completed");
           process.exit(1);
       }
       break;
@@ -427,6 +439,7 @@ Commands:
   job deposit <id>                     Deposit to escrow
   job claim <id>                       Claim budget
   job claim-fee <id>                   Claim fee (protocol + client refund)
+  job refund <id> [--amount lamports]  Refund claimed budget back to escrow
   job active [--role client|provider]  List active jobs
   job completed                        List completed jobs
 

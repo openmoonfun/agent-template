@@ -1,5 +1,5 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
+import { PublicKey, SystemProgram, Transaction, type Keypair } from "@solana/web3.js";
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
@@ -7,6 +7,8 @@ import {
   createAssociatedTokenAccountIdempotentInstruction,
   createTransferInstruction,
   createCloseAccountInstruction,
+  createSyncNativeInstruction,
+  NATIVE_MINT,
 } from "@solana/spl-token";
 import axios from "axios";
 import {
@@ -30,6 +32,21 @@ import {
 import { getApiUrl } from "../../lib/config";
 const API_URL = getApiUrl();
 const client = axios.create({ baseURL: API_URL });
+
+const MEMO_TYPE = {
+  JobRequest: 0,
+  Agreement: 1,
+  Transaction: 2,
+  Deliverable: 3,
+  General: 4,
+} as const;
+
+function isMemoType(memo: any, type: keyof typeof MEMO_TYPE): boolean {
+  if (!memo) return false;
+  const numeric = MEMO_TYPE[type];
+  const lower = type.charAt(0).toLowerCase() + type.slice(1);
+  return memo.memoType === numeric || memo.memoType === lower || memo.memoType === type;
+}
 
 /** Fetch job details from indexer (read-only) */
 export async function getJobStatus(jobId: string) {
@@ -73,7 +90,7 @@ export async function acceptOrRejectJob(
   const agentPda = new PublicKey(job.agent);
   const jobPda = getJobPda(agentPda, jid);
 
-  const jobRequestMemo = job.memos?.find((m: any) => m.memoType === "jobRequest");
+  const jobRequestMemo = job.memos?.find((m: any) => isMemoType(m, "JobRequest"));
   if (!jobRequestMemo) throw new Error("No JobRequest memo to sign");
 
   const memoSigPda = getMemoSigPda(jobPda, BigInt(jobRequestMemo.memoId), keypair.publicKey);
@@ -294,6 +311,107 @@ export async function claimBudget(jobId: string): Promise<{ tx: string | null; s
   return { tx: result.tx };
 }
 
+/** Push tokens from the provider's payment-mint ATA back into job escrow. */
+export async function refundBudget(
+  jobId: string,
+  amountLamports: number | bigint
+): Promise<{ tx: string }> {
+  const program = getProgram();
+  const keypair = getKeypair();
+
+  const job = await getJobStatus(jobId);
+  const agentPda = new PublicKey(job.agent);
+  const jobPda = getJobPda(agentPda, Number(job.jobId));
+
+  const jobAccount = await (program.account as any).job.fetch(jobPda);
+  const paymentMint: PublicKey = jobAccount.paymentMint;
+  const providerAta = getAssociatedTokenAddressSync(paymentMint, keypair.publicKey);
+
+  console.log(`[seller-api] Refunding ${amountLamports} lamports to escrow for job ${jobId}`);
+
+  const tx = await (program.methods as any)
+    .refundBudget(new anchor.BN(amountLamports.toString()))
+    .accounts({
+      provider: keypair.publicKey,
+      agent: agentPda,
+      job: jobPda,
+      escrowVault: getEscrowVaultPda(jobPda),
+      providerTokenAccount: providerAta,
+      tokenProgram: TOKEN_PROGRAM_ID,
+    })
+    .signers([keypair])
+    .rpc();
+
+  console.log(`[seller-api] Refunded ${amountLamports} lamports for job ${jobId}: tx=${tx}`);
+  return { tx };
+}
+
+const WRAP_REFUND_TX_FEE_LAMPORTS = 10_000;
+
+/** Refund leftover native SOL from a per-job wallet through ACP escrow. */
+export async function refundJobWalletViaAcp(
+  jobAddress: string,
+  jobKeypair: Keypair
+): Promise<{ refundLamports: number; wrapTx: string; refundTx: string } | null> {
+  const program = getProgram();
+  const providerKp = getKeypair();
+  const connection = program.provider.connection;
+
+  const balance = await connection.getBalance(jobKeypair.publicKey, "confirmed");
+  if (balance <= WRAP_REFUND_TX_FEE_LAMPORTS) return null;
+  const refundLamports = balance - WRAP_REFUND_TX_FEE_LAMPORTS;
+
+  const providerWsolAta = getAssociatedTokenAddressSync(
+    NATIVE_MINT,
+    providerKp.publicKey
+  );
+
+  const wrapTx = new Transaction().add(
+    SystemProgram.transfer({
+      fromPubkey: jobKeypair.publicKey,
+      toPubkey: providerKp.publicKey,
+      lamports: refundLamports,
+    }),
+    createAssociatedTokenAccountIdempotentInstruction(
+      providerKp.publicKey,
+      providerWsolAta,
+      providerKp.publicKey,
+      NATIVE_MINT
+    ),
+    SystemProgram.transfer({
+      fromPubkey: providerKp.publicKey,
+      toPubkey: providerWsolAta,
+      lamports: refundLamports,
+    }),
+    createSyncNativeInstruction(providerWsolAta)
+  );
+  wrapTx.feePayer = providerKp.publicKey;
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+  wrapTx.recentBlockhash = blockhash;
+  wrapTx.lastValidBlockHeight = lastValidBlockHeight;
+  wrapTx.sign(providerKp, jobKeypair);
+
+  const wrapSig = await connection.sendRawTransaction(wrapTx.serialize(), {
+    skipPreflight: false,
+    maxRetries: 3,
+  });
+  const wrapRes = await connection.confirmTransaction(
+    { signature: wrapSig, blockhash, lastValidBlockHeight },
+    "confirmed"
+  );
+  if (wrapRes.value.err) {
+    throw new Error(
+      `wrap to provider WSOL ATA failed: ${JSON.stringify(wrapRes.value.err)}`
+    );
+  }
+
+  const { tx: refundTxSig } = await refundBudget(jobAddress, refundLamports);
+  console.log(
+    `[seller-api] Job ${jobAddress} — refunded ${refundLamports} lamports via ACP (wrap=${wrapSig} refund=${refundTxSig})`
+  );
+  return { refundLamports, wrapTx: wrapSig, refundTx: refundTxSig };
+}
+
 /** Claim fee from escrow — returns unused fee to client + protocol share to treasury */
 export async function claimFee(jobId: string): Promise<{ tx: string | null; skipped?: boolean }> {
   const program = getProgram();
@@ -349,6 +467,44 @@ export async function claimFee(jobId: string): Promise<{ tx: string | null; skip
 }
 
 const NATIVE_MINT_STR = "So11111111111111111111111111111111111111112";
+
+/** Close provider WSOL ATA and transfer native SOL to a destination in one tx. */
+export async function unwrapAndTransferSol(
+  destination: PublicKey,
+  lamports: number | bigint
+): Promise<string> {
+  const keypair = getKeypair();
+  const connection = getProgram().provider.connection;
+
+  const wsolAta = getAssociatedTokenAddressSync(
+    new PublicKey(NATIVE_MINT_STR),
+    keypair.publicKey
+  );
+
+  const tx = new Transaction().add(
+    createCloseAccountInstruction(wsolAta, keypair.publicKey, keypair.publicKey),
+    SystemProgram.transfer({
+      fromPubkey: keypair.publicKey,
+      toPubkey: destination,
+      lamports: BigInt(lamports),
+    })
+  );
+  tx.feePayer = keypair.publicKey;
+  tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+  tx.sign(keypair);
+
+  const sig = await connection.sendRawTransaction(tx.serialize(), {
+    skipPreflight: false,
+    maxRetries: 3,
+    preflightCommitment: "confirmed",
+  });
+  await connection.confirmTransaction(sig, "confirmed");
+
+  console.log(
+    `[seller-api] Unwrapped WSOL ATA and sent ${lamports} lamports to ${destination.toBase58()}: ${sig}`
+  );
+  return sig;
+}
 
 /** Transfer SPL tokens (or native SOL) from provider wallet to a destination wallet.
  *  If closeSourceAta=true, appends a CloseAccount ix to reclaim rent (only for SPL, not SOL). */
@@ -426,4 +582,3 @@ export async function transferToken(
   console.log(`[seller-api] Transferred ${amountLamports} of ${mint.toBase58()} to ${destinationWallet.toBase58()}${closeSourceAta ? " (closed source ATA)" : ""}: ${sig}`);
   return sig;
 }
-

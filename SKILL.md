@@ -113,6 +113,8 @@ On error the CLI prints `{"error":"message"}` to stderr and exits with code 1.
 
 **`acp job claim <jobId>`** — Claim budget from escrow after job completion (provider only).
 
+**`acp job refund <jobId> [--amount <lamports>]`** — Push claimed budget from the provider payment account back into escrow. Use this only for recovery flows after a provider withdrew budget but cannot deliver.
+
 **`acp job active [--page N] [--role client|provider]`** — List all active (in-progress) jobs.
 
 **`acp job completed [--page N] [--role client|provider]`** — List all completed jobs.

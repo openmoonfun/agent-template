@@ -11,6 +11,8 @@ const MODEL = getAnthropicModel();
 
 let anthropic: Anthropic | null = null;
 
+const SIDE_CHANNEL_TOOL_NAMES = new Set(["set_title"]);
+
 function getClient(): Anthropic {
   if (!anthropic) {
     const apiKey = getAnthropicApiKey();
@@ -44,6 +46,18 @@ function buildToolsFromOfferings(): {
       name: "check_balance",
       description: "Check the user's wallet balances (SOL and USDC) on Solana.",
       input_schema: { type: "object" as const, properties: {}, required: [] },
+    },
+    {
+      name: "set_title",
+      description:
+        "Set or update the conversation title. Call this once on the first turn of a new chat, before other tools or prose. Keep titles short and specific: 2-6 words.",
+      input_schema: {
+        type: "object" as const,
+        properties: {
+          title: { type: "string" as const, description: "Short chat title, 2-6 words." },
+        },
+        required: ["title"],
+      },
     },
   ];
 
@@ -208,11 +222,24 @@ async function executeTool(
     }
   }
 
-  // All other tools map to offerings — return as pending job for the frontend
+  // All other tools map to offerings — return as pending job for the frontend.
+  // Include pricing metadata so the UI can show the real budget breakdown.
+  const cfg = OFFERING_CONFIGS.get(name);
+  const pricing: Record<string, any> = {};
+  if (cfg) {
+    if (typeof cfg.fee === "number" || typeof cfg.feeValue === "number") {
+      pricing.fee = cfg.feeValue ?? cfg.fee;
+    }
+    if (typeof cfg.feeType === "string") pricing.feeType = cfg.feeType;
+    if (typeof cfg.budgetReserve === "number") pricing.budgetReserve = cfg.budgetReserve;
+    if (typeof cfg.slaMinutes === "number") pricing.slaMinutes = cfg.slaMinutes;
+  }
+
   return {
     status: "pending",
     offering: name,
     ...input,
+    ...pricing,
     message: `Executing ${name}`,
   };
 }
@@ -226,7 +253,8 @@ export async function handleChatMessage(
   agentMint: string,
   userMessage: string,
   history: ChatMessage[],
-  userWallet?: string | null
+  userWallet?: string | null,
+  onTitle?: (title: string) => void
 ): Promise<string> {
   const client = getClient();
 
@@ -271,6 +299,20 @@ export async function handleChatMessage(
         if (block.type === "text") {
           blocks.push({ type: "text", content: block.text });
         } else if (block.type === "tool_use") {
+          if (SIDE_CHANNEL_TOOL_NAMES.has(block.name)) {
+            if (block.name === "set_title" && onTitle) {
+              const raw = (block.input as any)?.title;
+              const title = typeof raw === "string" ? raw.trim().slice(0, 80) : "";
+              if (title) onTitle(title);
+            }
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: block.id,
+              content: JSON.stringify({ ok: true }),
+            });
+            continue;
+          }
+
           const toolResult = await executeTool(block.name, block.input as Record<string, any>, userWallet || null);
           blocks.push({ type: "tool_call", name: block.name, input: block.input, result: toolResult });
 

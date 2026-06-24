@@ -27,6 +27,21 @@ import {
   zeroHash,
 } from "../lib/pda";
 
+const MEMO_TYPE = {
+  JobRequest: 0,
+  Agreement: 1,
+  Transaction: 2,
+  Deliverable: 3,
+  General: 4,
+} as const;
+
+function isMemoType(memo: any, type: keyof typeof MEMO_TYPE): boolean {
+  if (!memo) return false;
+  const numeric = MEMO_TYPE[type];
+  const lower = type.charAt(0).toLowerCase() + type.slice(1);
+  return memo.memoType === numeric || memo.memoType === lower || memo.memoType === type;
+}
+
 /**
  * Parse a base58 Solana address from user input, exiting with a clear error
  * instead of throwing a cryptic TypeError from PublicKey's constructor.
@@ -160,7 +175,7 @@ export async function accept(jobId: string, doAccept: boolean, reason?: string) 
   const jobPda = getJobPda(agentPda, jid);
 
   // Find JobRequest memo
-  const jobRequestMemo = job.memos?.find((m: any) => m.memoType === "jobRequest");
+  const jobRequestMemo = job.memos?.find((m: any) => isMemoType(m, "JobRequest"));
   if (!jobRequestMemo) throw new Error("No JobRequest memo to sign");
 
   const memoSigPda = getMemoSigPda(jobPda, BigInt(jobRequestMemo.memoId), keypair.publicKey);
@@ -388,6 +403,52 @@ export async function claim(jobId: string, amount?: number) {
   });
 }
 
+export async function refund(jobId: string, amount?: number) {
+  const program = getProgram();
+  const keypair = getKeypair();
+
+  const { data: job } = await getClient().get(`/acp/jobs/${jobId}`);
+
+  const agentPda = new PublicKey(job.agent);
+  const jobPda = getJobPda(agentPda, Number(job.jobId));
+  const escrowVault = getEscrowVaultPda(jobPda);
+
+  const jobAccount = await (program.account as any).job.fetch(jobPda);
+  const paymentMint: PublicKey = jobAccount.paymentMint;
+  const outstanding = Number(jobAccount.amountClaimed) - Number(jobAccount.amountRefunded);
+
+  if (outstanding <= 0) {
+    error(`Nothing to refund — amountClaimed=${jobAccount.amountClaimed} amountRefunded=${jobAccount.amountRefunded}`);
+    process.exit(1);
+  }
+
+  const refundLamports = amount ?? outstanding;
+  if (refundLamports > outstanding) {
+    error(`Refund amount ${refundLamports} exceeds outstanding ${outstanding}`);
+    process.exit(1);
+  }
+
+  const providerAta = getAssociatedTokenAddressSync(paymentMint, keypair.publicKey);
+
+  const tx = await (program.methods as any)
+    .refundBudget(new anchor.BN(refundLamports))
+    .accounts({
+      provider: keypair.publicKey,
+      agent: agentPda,
+      job: jobPda,
+      escrowVault,
+      providerTokenAccount: providerAta,
+      tokenProgram: TOKEN_PROGRAM_ID,
+    })
+    .signers([keypair])
+    .rpc();
+
+  output({ tx, lamports: refundLamports }, (d) => {
+    success(`Refunded ${d.lamports} lamports to escrow`);
+    field("TX", d.tx);
+  });
+}
+
 export async function claimFee(jobId: string) {
   const program = getProgram();
   const keypair = getKeypair();
@@ -458,7 +519,7 @@ export async function pay(jobId: string, doAccept: boolean, content?: string) {
   const acpStatePda = getAcpStatePda();
 
   // Find the agreement memo with payment amount
-  const agreementMemo = job.memos?.find((m: any) => m.memoType === "agreement");
+  const agreementMemo = job.memos?.find((m: any) => isMemoType(m, "Agreement"));
   let amount: number | undefined;
   if (agreementMemo?.content) {
     try {

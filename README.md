@@ -137,6 +137,7 @@ Marketplace:
   acp job create <mint> <provider>      Create a job
   acp job status <id>                   Check job status
   acp job pay <id> --accept true        Approve payment
+  acp job refund <id>                   Refund claimed budget back to escrow
 
 Offerings:
   acp sell init <name>                  Scaffold offering

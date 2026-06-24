@@ -27,6 +27,27 @@ const pending = new Map<string, number>();
 const indexerLagFirstSeen = new Map<string, number>();
 const INDEXER_LAG_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
 
+const MEMO_TYPE = {
+  JobRequest: 0,
+  Agreement: 1,
+  Transaction: 2,
+  Deliverable: 3,
+  General: 4,
+} as const;
+
+function isMemoType(memo: any, type: keyof typeof MEMO_TYPE): boolean {
+  if (!memo) return false;
+  const numeric = MEMO_TYPE[type];
+  const lower = type.charAt(0).toLowerCase() + type.slice(1);
+  return memo.memoType === numeric || memo.memoType === lower || memo.memoType === type;
+}
+
+function hasOwnGeneralMemo(job: any, wallet: string): boolean {
+  return !!job.memos?.some(
+    (m: any) => isMemoType(m, "General") && m.sender === wallet
+  );
+}
+
 /** Returns true if we should skip due to indexer lag, false if timeout expired and we should proceed */
 function shouldSkipForIndexerLag(jobAddress: string, dbCount: number, onChainCount: number): boolean {
   if (onChainCount <= dbCount) {
@@ -75,7 +96,7 @@ async function getOffering(name: string): Promise<LoadedOffering | null> {
 
 /** Try to parse requirements JSON from job's JobRequest memo */
 function parseRequirements(job: any): { offeringName: string; request: Record<string, any> } | null {
-  const jobRequestMemo = job.memos?.find((m: any) => m.memoType === "jobRequest");
+  const jobRequestMemo = job.memos?.find((m: any) => isMemoType(m, "JobRequest"));
   if (!jobRequestMemo?.content) return null;
 
   try {
@@ -209,10 +230,11 @@ async function handleRequest(job: any, key: string) {
 
 async function handleNegotiation(job: any, key: string) {
   // Check if we already created an Agreement memo
-  const hasAgreement = job.memos?.some(
-    (m: any) => m.memoType === "agreement" || m.memoType === "Agreement"
-  );
+  const hasAgreement = job.memos?.some((m: any) => isMemoType(m, "Agreement"));
   if (hasAgreement) return;
+
+  const ownWallet = getKeypair().publicKey.toBase58();
+  if (hasOwnGeneralMemo(job, ownWallet)) return;
 
   // If on-chain has more memos than DB knows about, DB is stale — skip to avoid duplicates (with timeout)
   const dbMemoCount = job.memos?.length ?? 0;
@@ -229,10 +251,12 @@ async function handleNegotiation(job: any, key: string) {
   let feeType = "fixed";
   let supportedMints: string[] = [];
   let budgetHuman = 0;
+  let resolvedOffering: LoadedOffering | null = null;
 
   if (offeringName) {
     const resolved = await resolveOffering(offeringName);
     if (resolved) {
+      resolvedOffering = resolved.offering;
       const config = resolved.offering.config;
       feeRate = config?.feeValue ?? config?.fee ?? 0;
       feeType = config?.feeType ?? "fixed";
@@ -240,15 +264,10 @@ async function handleNegotiation(job: any, key: string) {
     }
   }
 
-  // Budget = requested amount from job request (human-readable units)
+  // Default budget = requested amount from job request (human-readable units).
+  // Offerings can override it in prepareAgreement() before lamport conversion.
   if (parsed?.request) {
     budgetHuman = parsed.request.amount ?? 0;
-  }
-
-  // Platform fee
-  let feeHuman = feeRate;
-  if (feeType === "percentage" && budgetHuman > 0) {
-    feeHuman = budgetHuman * feeRate;
   }
 
   // Get payment mint decimals from on-chain job to convert correctly
@@ -256,9 +275,6 @@ async function handleNegotiation(job: any, key: string) {
   const paymentMint: string = jobAccount.paymentMint.toBase58();
   const decimals = await getTokenDecimals(paymentMint);
   const factor = 10 ** decimals;
-
-  const budgetLamports = Math.round(budgetHuman * factor);
-  const feeLamports = Math.round(feeHuman * factor);
 
   // Reverse lookup: mint address → symbol (e.g. "SOL", "USDC")
   const mintToSymbol = Object.entries(KNOWN_MINTS).find(([, addr]) => addr === paymentMint);
@@ -270,8 +286,45 @@ async function handleNegotiation(job: any, key: string) {
   const outputSymbolEntry = outputMintAddress ? Object.entries(KNOWN_MINTS).find(([, addr]) => addr === outputMintAddress) : undefined;
   const outputSymbol = outputSymbolEntry ? outputSymbolEntry[0] : undefined;
 
+  let agreementMessage = "Accepting the job. Terms agreed.";
+  let extraAgreement: Record<string, any> = {};
+  if (resolvedOffering?.handlers.prepareAgreement) {
+    try {
+      const prep = await resolvedOffering.handlers.prepareAgreement({
+        ...(parsed?.request ?? {}),
+        jobAddress: job.address,
+        clientWallet: jobAccount.client.toBase58(),
+        paymentMint,
+        paymentDecimals: decimals,
+        budget: budgetHuman,
+      });
+      if (prep?.extraMessage) agreementMessage = prep.extraMessage;
+      if (prep?.extra) extraAgreement = prep.extra;
+      if (typeof prep?.budgetOverride === "number") budgetHuman = prep.budgetOverride;
+    } catch (e: any) {
+      console.error(`[seller] Job ${job.address.slice(0, 8)}... — prepareAgreement failed: ${e.message}`);
+      if (hasOwnGeneralMemo(job, ownWallet)) return;
+      try {
+        await createMemo(job.address, "general", JSON.stringify({ error: e.message }));
+      } catch (memoErr: any) {
+        console.error(`[seller] Job ${job.address.slice(0, 8)}... — failed to post rejection memo: ${memoErr.message}`);
+      }
+      return;
+    }
+  }
+
+  // Platform fee is computed after prepareAgreement(), so percentage fees see
+  // the final budget when the offering overrides it.
+  let feeHuman = feeRate;
+  if (feeType === "percentage" && budgetHuman > 0) {
+    feeHuman = budgetHuman * feeRate;
+  }
+
+  const budgetLamports = Math.round(budgetHuman * factor);
+  const feeLamports = Math.round(feeHuman * factor);
+
   const agreementContent = JSON.stringify({
-    message: "Accepting the job. Terms agreed.",
+    message: agreementMessage,
     offering: offeringName || "unknown",
     budget: budgetHuman,
     fee: feeHuman,
@@ -282,6 +335,7 @@ async function handleNegotiation(job: any, key: string) {
     ...(outputMintAddress && { outputMint: outputMintAddress }),
     ...(outputSymbol && { outputSymbol }),
     ...(supportedMints.length > 0 && { supportedMints }),
+    ...extraAgreement,
   });
 
   console.log(`[seller] Job ${job.address.slice(0, 8)}... — setting budget=${budgetLamports} fee=${feeLamports} (decimals=${decimals}) + creating Agreement memo`);
@@ -298,9 +352,7 @@ async function handleNegotiation(job: any, key: string) {
 
 async function handleTransaction(job: any, key: string) {
   // Check if Transaction memo exists
-  const txMemo = job.memos?.find(
-    (m: any) => m.memoType === "transaction" || m.memoType === "Transaction"
-  );
+  const txMemo = job.memos?.find((m: any) => isMemoType(m, "Transaction"));
 
   if (!txMemo) {
     // If on-chain has more memos than DB, skip — DB is stale (with timeout)
@@ -345,8 +397,11 @@ async function handleTransaction(job: any, key: string) {
 }
 
 async function handleEvaluation(job: any, key: string) {
-  const hasDeliverable = job.memos?.some((m: any) => m.memoType === "deliverable");
+  const hasDeliverable = job.memos?.some((m: any) => isMemoType(m, "Deliverable"));
   if (hasDeliverable) return;
+
+  const ownWallet = getKeypair().publicKey.toBase58();
+  if (hasOwnGeneralMemo(job, ownWallet)) return;
 
   // If on-chain has more memos than DB knows about, DB is stale — skip to avoid duplicates (with timeout)
   const dbMemoCount = job.memos?.length ?? 0;
@@ -368,10 +423,20 @@ async function handleEvaluation(job: any, key: string) {
 
   const { offering, delegated } = resolved;
 
-  // Inject jobAddress and offering config so handlers can interact with ACP escrow
+  let clientWallet: string | undefined;
+  try {
+    const jobAccount = await getOnChainJobFull(job.address);
+    clientWallet = jobAccount.client.toBase58();
+  } catch (e: any) {
+    console.warn(`[seller] Job ${job.address.slice(0, 8)}... — could not fetch on-chain client: ${e.message}`);
+  }
+
+  // Inject jobAddress, clientWallet, and offering config so handlers can
+  // interact with ACP escrow and verify the requester.
   const baseRequest = {
     ...request,
     jobAddress: job.address,
+    clientWallet,
     _offeringConfig: offering.config,
   };
 
@@ -393,7 +458,13 @@ async function handleEvaluation(job: any, key: string) {
     await createMemo(job.address, "deliverable", deliverable);
   } catch (e: any) {
     console.error(`[seller] Job ${job.address.slice(0, 8)}... — execution failed: ${e.message}`);
-    await createMemo(job.address, "general", JSON.stringify({ error: e.message }));
+    if (e?.stack) console.error(e.stack);
+    if (hasOwnGeneralMemo(job, ownWallet)) return;
+    try {
+      await createMemo(job.address, "general", JSON.stringify({ error: e.message }));
+    } catch (memoErr: any) {
+      console.error(`[seller] Job ${job.address.slice(0, 8)}... — failed to post failure memo: ${memoErr.message}`);
+    }
   }
 }
 
@@ -485,6 +556,7 @@ function connectChat(agentAddress: string) {
       wallet,
       offerings,
       resources: chatResources,
+      capabilities: { chat: true },
     },
   });
 
@@ -528,7 +600,13 @@ function connectChat(agentAddress: string) {
           role: m.role as "user" | "agent",
           content: m.content,
         })),
-        data.wallet
+        data.wallet,
+        (title) => {
+          chatSocket.emit("chat:update_title", {
+            conversationId: data.conversationId,
+            title,
+          });
+        }
       );
 
       chatSocket.emit("chat:response", {
@@ -589,6 +667,7 @@ async function main() {
         description: o!.config.description || "",
         fee: o!.config.feeValue ?? o!.config.fee ?? 0,
         feeType: o!.config.feeType || "fixed",
+        budgetReserve: o!.config.budgetReserve ?? 0,
         slaMinutes: o!.config.slaMinutes ?? 30,
         requiredFunds: o!.config.requiredFunds ?? false,
         requirement: o!.config.requirement ?? {},

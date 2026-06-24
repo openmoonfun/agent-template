@@ -8,6 +8,7 @@ export interface OfferingConfig {
   fee?: number;
   feeType?: string;
   feeValue?: number;
+  budgetReserve?: number;
 
   slaMinutes?: number;
   requiredFunds?: boolean;

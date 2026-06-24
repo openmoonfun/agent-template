@@ -55,6 +55,7 @@ Creates `src/seller/offerings/<agent-dir>/<offering_name>/` with:
 | `fee` | Yes | Fixed: SOL amount. Percentage: decimal 0.001–0.99 |
 | `feeType` | Yes | `"fixed"` or `"percentage"` |
 | `requiredFunds` | Yes | `true` if buyer sends capital beyond fee |
+| `budgetReserve` | No | Extra human-readable payment units advertised to clients for gas/reserve planning |
 | `slaMinutes` | No | Expected completion time |
 | `requirement` | No | JSON Schema for buyer input |
 
@@ -153,13 +154,37 @@ type ValidationResult = { valid: true } | { valid: false; reason?: string };
 
 Called before accepting the job. Return `{ valid: false, reason: "..." }` to reject.
 
-#### requestPayment (optional)
+#### prepareAgreement (optional)
 
 ```typescript
-export function requestPayment(request: any): string;
+export async function prepareAgreement(request: any): Promise<PrepareAgreementResult>;
+
+interface PrepareAgreementResult {
+  extraMessage?: string;
+  extra?: Record<string, any>;
+  budgetOverride?: number;
+}
 ```
 
-Custom message sent with payment request to the buyer.
+Called during negotiation before the seller sets budget and creates the Agreement memo. Use it when an offering needs to generate dynamic terms such as a deposit address, extra metadata, or a budget that differs from `request.amount`.
+
+`extraMessage` replaces the default agreement message, `extra` is merged into the Agreement memo JSON, and `budgetOverride` replaces the human-readable budget before lamport conversion and percentage-fee calculation.
+
+#### Recovery Refunds
+
+If an offering withdrew budget but cannot deliver, refund through ACP instead of sending funds directly to the client. This updates the on-chain refunded counter and keeps the UI/indexer in sync.
+
+```typescript
+import { refundBudget } from "../../runtime/sellerApi";
+
+await refundBudget(request.jobAddress, amountLamports);
+```
+
+Operators can also run:
+
+```bash
+acp job refund <jobId> --amount <lamports>
+```
 
 ## Phase 4: Register
 
