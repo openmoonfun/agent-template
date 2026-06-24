@@ -1,0 +1,8 @@
+{
+  "rpc": "https://api.mainnet-beta.solana.com",
+  "apiUrl": "https://your-indexer.example.com",
+  "chatUrl": "https://your-indexer.example.com",
+  "pollInterval": 10000,
+  "activeAgent": "",
+  "agents": {}
+}
