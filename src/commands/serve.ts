@@ -1,6 +1,7 @@
 import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
+import { Keypair, PublicKey } from "@solana/web3.js";
 import {
   ROOT,
   LOGS_DIR,
@@ -9,11 +10,57 @@ import {
   writePidToConfig,
   removePidFromConfig,
   listAgentNames,
+  type AgentEntry,
 } from "../lib/config";
 import { log, success, error, warn, field, heading } from "../lib/output";
+import { getProgram } from "../lib/program";
 import { syncDescription } from "./sell";
 
-function startAgent(agentName: string): boolean {
+function loadAgentKeypair(raw: string): Keypair {
+  const trimmed = raw.trim();
+  if (trimmed.startsWith("[")) {
+    return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(trimmed)));
+  }
+
+  const resolved = path.isAbsolute(trimmed)
+    ? trimmed
+    : path.resolve(ROOT, trimmed);
+  const secretKey = JSON.parse(fs.readFileSync(resolved, "utf-8"));
+  return Keypair.fromSecretKey(Uint8Array.from(secretKey));
+}
+
+async function warnIfProviderMismatch(agentName: string, agent: AgentEntry): Promise<void> {
+  if (!agent.address || !agent.wallet) return;
+
+  let localProvider: string;
+  try {
+    localProvider = loadAgentKeypair(agent.wallet).publicKey.toBase58();
+  } catch (e: any) {
+    warn(`${agentName}: could not read local provider key: ${e.message || e}`);
+    return;
+  }
+
+  try {
+    const agentAccount = await (getProgram().account as any).agent.fetch(
+      new PublicKey(agent.address),
+    );
+    const onchainProvider =
+      typeof agentAccount.provider?.toBase58 === "function"
+        ? agentAccount.provider.toBase58()
+        : String(agentAccount.provider);
+
+    if (onchainProvider === localProvider) return;
+
+    warn(`${agentName}: provider key does not match the on-chain agent provider.`);
+    field("  Local provider", localProvider);
+    field("  On-chain provider", onchainProvider);
+    log("  Open the agent page in the app, go to Provider Info, paste the local provider address, and save it.");
+  } catch (e: any) {
+    warn(`${agentName}: could not verify on-chain provider: ${e.message || e}`);
+  }
+}
+
+async function startAgent(agentName: string): Promise<boolean> {
   const existing = findSellerPid(agentName);
   if (existing) {
     warn(`${agentName}: already running (PID ${existing})`);
@@ -26,6 +73,8 @@ function startAgent(agentName: string): boolean {
     error(`${agentName}: not found in config`);
     return false;
   }
+
+  await warnIfProviderMismatch(agentName, agent);
 
   if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR, { recursive: true });
 
@@ -71,7 +120,7 @@ export async function start(all = false) {
 
     heading("Starting all agents");
     for (const name of agents) {
-      startAgent(name);
+      await startAgent(name);
     }
 
     // Sync descriptions for all
@@ -87,7 +136,7 @@ export async function start(all = false) {
     return;
   }
 
-  startAgent(agentName);
+  await startAgent(agentName);
   await syncDescription();
 }
 
