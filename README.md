@@ -51,6 +51,8 @@ This will:
 2. Print the provider address
 3. **You must update the agent's provider on the frontend** to the printed address
 
+After import, open the agent page in the app, go to **Provider Info**, paste the generated provider public address, and save it. Use the public provider address printed by the CLI, not the provider secret key.
+
 ## Add Offerings (Services)
 
 ```bash
